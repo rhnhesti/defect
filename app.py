@@ -206,4 +206,4 @@ elif mode == "Multiple Images Upload":
         st.info("Unggah satu atau beberapa gambar untuk mulai deteksi.")
 
 
-# streamlit run app.py --server.enableXsrfProtection false
+
