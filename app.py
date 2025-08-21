@@ -1,161 +1,209 @@
+# app.py
+import supervision as sv
+from ultralytics import YOLO
 import streamlit as st
-import logging
-import os
-import cv2
-import numpy as np
 from PIL import Image
 from io import BytesIO
-import supervision as sv
+import numpy as np
+import cv2
+import logging
 import json
-from ultralytics import YOLO
-
-# Set the environment variable
+import os
+# cegah error duplikasi lib (intel MKL/OpenMP)
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+
+# ------------------------------- #
+# Konfigurasi dasar
+# ------------------------------- #
 logging.basicConfig(level=logging.WARNING)
-st.set_page_config(page_title="AI Object Detection", page_icon="🤖")
+st.set_page_config(page_title="YOLOvWeld", page_icon="🤖", layout="centered")
 
-# Define the zone polygon
-zone_polygon_m = np.array([[160, 100],
-                           [160, 380],
-                           [481, 380],
-                           [481, 100]], dtype=np.int32)
-
-# Initialize the YOLOv8 model
+# ------------------------------- #
+# Utilitas
+# ------------------------------- #
 
 
 @st.cache_resource
-def load_yolo_model(model_path):
-    return YOLO(model_path)
+def load_yolo_model(model_path: str):
+    """Load YOLO model sekali (cache)"""
+    try:
+        model = YOLO(model_path)
+    except Exception as e:
+        st.error(f"Gagal memuat model: {e}")
+        st.stop()
+    return model
 
 
-# Load the YOLO model (this will be cached)
-model = load_yolo_model("bestslag.pt")  # Ganti "best.pt" dengan model Anda
-
-# Initialize the tracker, annotators, and zone
-box_annotator = sv.BoundingBoxAnnotator()
-label_annotator = sv.LabelAnnotator()
-
-
-def save_detections_to_json(detections, file_name):
-    detections_data = [{
-        "box": box.tolist(),
-        "confidence": float(conf),
-        "class_id": int(class_id)
-    } for box, conf, class_id in zip(detections.xyxy, detections.confidence, detections.class_id)]
-
-    json_str = json.dumps(detections_data)
-    st.download_button(label="Download JSON", data=json_str,
-                       file_name=file_name, mime="application/json")
+def bytes_to_cv2_image(bytes_data: bytes):
+    """Konversi bytes -> ndarray BGR (cv2)"""
+    arr = np.frombuffer(bytes_data, np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("Gambar tidak valid / gagal didekode.")
+    return img  # BGR
 
 
-def main():
-    st.title("🤖 YOLOvWeld")
-    st.subheader("YOLOv8 & Streamlit Web Integration")
-    st.sidebar.title("Select an option ⤵️")
-    choice = st.sidebar.radio(
-        "", ("Capture Image And Predict", ":rainbow[Multiple Images Upload -]🖼️🖼️🖼️"), index=1)
-    conf = st.slider("Score threshold", 0.0, 1.0, 0.3, 0.05)
+def annotate_image(image_bgr: np.ndarray, detections: sv.Detections, labels: list):
+    """Gambar bbox + label ke citra"""
+    box_annotator = sv.BoundingBoxAnnotator()
+    label_annotator = sv.LabelAnnotator()
+    annotated = box_annotator.annotate(image_bgr.copy(), detections=detections)
+    annotated = label_annotator.annotate(
+        annotated, detections=detections, labels=labels)
+    # Tambah jumlah objek di kiri-atas
+    count_text = f"Objects in Frame: {len(detections)}"
+    cv2.putText(annotated, count_text, (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2, cv2.LINE_AA)
+    return annotated
 
-    if choice == "Capture Image And Predict":
-        img_file_buffer = st.camera_input("Take a picture")
 
-        if img_file_buffer is not None:
+def detections_to_json(detections: sv.Detections, class_names: dict):
+    """Konversi ke list dict (JSON-serializable)"""
+    out = []
+    xyxy = detections.xyxy  # (N, 4)
+    conf = detections.confidence  # (N,)
+    cls_ids = detections.class_id  # (N,)
+    for i in range(len(detections)):
+        box = xyxy[i].tolist()
+        c = float(conf[i]) if conf is not None else None
+        cid = int(cls_ids[i]) if cls_ids is not None else None
+        out.append({
+            "box": box,                         # [x1, y1, x2, y2]
+            "confidence": c,
+            "class_id": cid,
+            "class_name": class_names.get(cid, str(cid))
+        })
+    return out
+
+
+def cv2_to_download_bytes(image_bgr: np.ndarray, fmt: str = "JPEG"):
+    """Konversi BGR -> bytes (untuk download)"""
+    img = Image.fromarray(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
+    buf = BytesIO()
+    img.save(buf, format=fmt)
+    return buf.getvalue()
+
+
+# ------------------------------- #
+# Load model (ganti nama file sesuai punyamu)
+# ------------------------------- #
+MODEL_PATH = "bestslag.pt"  # <--- ganti jika perlu
+model = load_yolo_model(MODEL_PATH)
+
+# ------------------------------- #
+# UI
+# ------------------------------- #
+st.title("🤖 YOLOvWeld Detection")
+st.subheader("YOLOv8 + Streamlit")
+st.sidebar.title("Pilih Mode")
+mode = st.sidebar.radio(
+    "", ("Capture Image & Predict", "Multiple Images Upload"))
+conf_thres = st.slider("Score threshold", 0.0, 1.0, 0.3, 0.05)
+
+# ------------------------------- #
+# MODE 1: Kamera
+# ------------------------------- #
+if mode == "Capture Image & Predict":
+    img_file_buffer = st.camera_input("Ambil gambar dari kamera")
+    if img_file_buffer is not None:
+        try:
             bytes_data = img_file_buffer.getvalue()
-            cv2_img = cv2.imdecode(np.frombuffer(
-                bytes_data, np.uint8), cv2.IMREAD_COLOR)
+            img_bgr = bytes_to_cv2_image(bytes_data)
 
-            results = model.predict(cv2_img)
-            results1 = results[0] if isinstance(results, list) else results
+            # Inference
+            results = model.predict(img_bgr, conf=conf_thres, verbose=False)
+            res = results[0] if isinstance(results, list) else results
 
-            detections = sv.Detections.from_ultralytics(results1)
-            detections = detections[detections.confidence > conf]
-            labels = [
-                f"#{index + 1}: {results1.names[class_id]}"
-                for index, class_id in enumerate(detections.class_id)
-            ]
+            # Supervision Detections
+            detections = sv.Detections.from_ultralytics(res)
+            # filter ulang agar pasti sesuai slider
+            if detections.confidence is not None:
+                detections = detections[detections.confidence > conf_thres]
 
-            labels1 = [
-                f"#{index + 1}: {results1.names[class_id]} (Accuracy: {detections.confidence[index]:.2f})"
-                for index, class_id in enumerate(detections.class_id)]
+            # Labels: "#i: class (conf)"
+            labels = []
+            names = res.names  # dict id->name
+            for i, cid in enumerate(detections.class_id or []):
+                cname = names.get(int(cid), str(cid))
+                cval = float(
+                    detections.confidence[i]) if detections.confidence is not None else 0.0
+                labels.append(f"#{i+1}: {cname} (Accuracy: {cval:.2f})")
 
-            annotated_frame1 = box_annotator.annotate(
-                cv2_img, detections=detections)
-            annotated_frame1 = label_annotator.annotate(
-                annotated_frame1, detections=detections, labels=labels)
+            # Annotate & Tampilkan
+            annotated = annotate_image(img_bgr, detections, labels)
+            st.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
+                     caption="Hasil Deteksi", use_container_width=True)
 
-            st.image(annotated_frame1, channels="BGR")
-            st.write(':orange[ Info : ⤵️ ]')
-            st.json(labels1)
+            # Info JSON
+            st.write(':orange[Info Deteksi:]')
+            st.json(labels if labels else ["Tidak ada objek terdeteksi"])
+            json_data = json.dumps(detections_to_json(
+                detections, names), ensure_ascii=False, indent=2)
+            st.download_button("Download JSON Deteksi", json_data,
+                               file_name="detections.json", mime="application/json")
 
-            # Convert annotated image to bytes for download
-            img = Image.fromarray(cv2.cvtColor(
-                annotated_frame1, cv2.COLOR_BGR2RGB))
-            buf = BytesIO()
-            img.save(buf, format="JPEG")
-            byte_im = buf.getvalue()
+            # Download gambar anotasi
+            img_bytes = cv2_to_download_bytes(annotated, fmt="JPEG")
+            st.download_button("Download Gambar dengan Deteksi", img_bytes,
+                               file_name="detected_image.jpg", mime="image/jpeg")
+        except Exception as e:
+            st.error(f"Terjadi error saat memproses gambar: {e}")
 
-            # Button to download image
-            st.download_button(label="Download Image with Detections",
-                               data=byte_im, file_name="detected_image.jpg", mime="image/jpeg")
+# ------------------------------- #
+# MODE 2: Multi Upload
+# ------------------------------- #
+elif mode == "Multiple Images Upload":
+    uploaded_files = st.file_uploader("Pilih gambar", type=['png', 'jpg', 'jpeg', 'webp', 'bmp'],
+                                      accept_multiple_files=True)
+    if uploaded_files:
+        for uf in uploaded_files:
+            st.markdown("---")
+            st.write(f"**File:** {uf.name}")
+            try:
+                bytes_data = uf.read()  # cukup sekali read
+                img_bgr = bytes_to_cv2_image(bytes_data)
 
-            # Save detections to JSON
-            save_detections_to_json(detections, "detections.json")
+                # Inference
+                results = model.predict(
+                    img_bgr, conf=conf_thres, verbose=False)
+                res = results[0] if isinstance(results, list) else results
 
-    elif choice == ":rainbow[Multiple Images Upload -]🖼️🖼️🖼️":
-        uploaded_files = st.file_uploader(
-            "Choose images", type=['png', 'jpg', 'webp', 'bmp'], accept_multiple_files=True)
-        for uploaded_file in uploaded_files:
-            bytes_data = uploaded_file.read()
-            st.write("filename:", uploaded_file.name)
-            cv2_img = cv2.imdecode(np.frombuffer(
-                bytes_data, np.uint8), cv2.IMREAD_COLOR)
+                # Supervision Detections
+                detections = sv.Detections.from_ultralytics(res)
+                if detections.confidence is not None:
+                    detections = detections[detections.confidence > conf_thres]
 
-            results = model.predict(cv2_img)
-            results1 = results[0] if isinstance(results, list) else results
+                # Labels
+                labels = []
+                names = res.names
+                for i, cid in enumerate(detections.class_id or []):
+                    cname = names.get(int(cid), str(cid))
+                    cval = float(
+                        detections.confidence[i]) if detections.confidence is not None else 0.0
+                    labels.append(f"#{i+1}: {cname} (Accuracy: {cval:.2f})")
 
-            detections = sv.Detections.from_ultralytics(results1)
-            detections = detections[detections.confidence > conf]
-            labels = [
-                f"#{index + 1}: {results1.names[class_id]}"
-                for index, class_id in enumerate(detections.class_id)
-            ]
+                # Annotate & tampilkan
+                annotated = annotate_image(img_bgr, detections, labels)
+                st.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), caption=f"Hasil: {uf.name}",
+                         use_container_width=True)
 
-            labels1 = [
-                f"#{index + 1}: {results1.names[class_id]} (Accuracy: {detections.confidence[index]:.2f})"
-                for index, class_id in enumerate(detections.class_id)
-            ]
+                # Info deteksi + unduhan
+                st.write(':orange[Info Deteksi:]')
+                st.json(labels if labels else ["Tidak ada objek terdeteksi"])
 
-            annotated_frame1 = box_annotator.annotate(
-                cv2_img, detections=detections)
-            annotated_frame1 = label_annotator.annotate(
-                annotated_frame1, detections=detections, labels=labels)
+                json_data = json.dumps(detections_to_json(
+                    detections, names), ensure_ascii=False, indent=2)
+                st.download_button(f"Download JSON ({uf.name})", json_data,
+                                   file_name=f"{uf.name}_detections.json", mime="application/json")
 
-            st.image(annotated_frame1, channels="BGR")
-            st.write(':orange[ Info : ⤵️ ]')
-            st.json(labels1)
+                img_bytes = cv2_to_download_bytes(annotated, fmt="JPEG")
+                st.download_button(f"Download Gambar ({uf.name})", img_bytes,
+                                   file_name=f"{uf.name}_detected.jpg", mime="image/jpeg")
+            except Exception as e:
+                st.error(f"Gagal memproses {uf.name}: {e}")
+    else:
+        st.info("Unggah satu atau beberapa gambar untuk mulai deteksi.")
 
-            # Convert annotated image to bytes for download
-            img = Image.fromarray(cv2.cvtColor(
-                annotated_frame1, cv2.COLOR_BGR2RGB))
-            buf = BytesIO()
-            img.save(buf, format="JPEG")
-            byte_im = buf.getvalue()
-
-            # Button to download image
-            st.download_button(label=f"Download {uploaded_file.name} with Detections",
-                               data=byte_im, file_name=f"{uploaded_file.name}_detected.jpg", mime="image/jpeg")
-
-            # Save detections to JSON
-            save_detections_to_json(
-                detections, f"{uploaded_file.name}_detections.json")
-
-    st.write(':orange[ Classes : ⤵️ ]')
-    cls_name = model.names
-    cls_lst = list(cls_name.values())
-    st.write(f':orange[{cls_lst}]')
-
-
-if __name__ == '__main__':
-    main()
 
 # streamlit run app.py --server.enableXsrfProtection false
