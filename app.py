@@ -29,7 +29,7 @@ def load_yolo_model(model_path):
 
 
 # Load the YOLO model (this will be cached)
-model = load_yolo_model("best.pt")  # Ganti "best.pt" dengan model Anda
+model = load_yolo_model("bestslag.pt")  # Ganti "best.pt" dengan model Anda
 
 # Initialize the tracker, annotators, and zone
 box_annotator = sv.BoundingBoxAnnotator()
